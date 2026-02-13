@@ -222,6 +222,35 @@ workloads:
     instances:
       default: { path: yolov8l_segmentation_640x640.onnx, bs: 1, img_height: 640, img_width: 640 }
 
+    name: YOLOV5S
+    basedir: workloads/onnx
+    module: yolov5s_fixed-640.onnx
+    instances:
+      default: { path: yolov5s_fixed-640.onnx,
+                 bs: 1,
+                 img_height: 640,
+                 img_width: 640 }
+
+  - api: TTSIM
+    name: MLP_SIMPLE
+    basedir: workloads/onnx/examples
+    module: SimpleMLP@simple_mlp_ttsim.py
+    params: { in_dim: 1024, hidden_dim: 2048, out_dim: 512, bs: 1 }
+    instances:
+      default: {}
+
+  - api: ONNX
+    name: MLP_SIMPLE
+    basedir: workloads/onnx
+    module: mlp_simple.onnx
+    instances:
+      default:
+        path: 'mlp_simple.onnx'
+        in_dim: 1024
+        hidden_dim: 2048
+        out_dim: 512
+        bs: 1
+      
   - api: TTSIM
     name: BEVDepth
     basedir: workloads/bevdepth
