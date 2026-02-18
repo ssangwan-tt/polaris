@@ -185,10 +185,6 @@ def tile_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = outshape
     oTList[0].dtype = dataT.dtype
 
-    # Compute data if available
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_tile
-    oTList[0].data = try_compute_data(compute_tile, iTList, op)
-
     op.perf_stats = {
             'inBytes' : int(iTList[0].nbytes(op.precision)) + int(iTList[1].nbytes(op.precision)),
             'inElems' : int(iTList[0].nelems()) + int(iTList[1].nelems()),
@@ -318,11 +314,6 @@ def slice_sinf(iTList, oTList, op, **kwargs):
 
     Y.shape = out_shape
     Y.dtype = dataT.dtype
-
-    # Compute data if inputs have data
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_slice
-    oTList[0].data = try_compute_data(compute_slice, iTList, op)
-
     inBytes = sum(x.nbytes(op.precision) for x in iTList)
     inElems = sum(x.nelems() for x in iTList)
 
@@ -351,11 +342,6 @@ def resize_sinf(iTList, oTList, op, **kwargs):
         scales[-2] = iTList[2].data[-2]
         oTList[0].shape = [int(scales[i] * x) for i,x in enumerate(iTList[0].shape)]
         oTList[0].dtype = iTList[0].dtype
-
-    # Compute data if input has data
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_resize
-    if iTList[0].data is not None:
-        oTList[0].data = try_compute_data(compute_resize, iTList, op)
 
     nElem = iTList[0].nelems()
     op.perf_stats = {
@@ -443,10 +429,6 @@ def concat_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = oshape
     oTList[0].dtype = iTList[0].dtype
 
-    # Compute data if inputs have data
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_concat
-    oTList[0].data = try_compute_data(compute_concat, iTList, op)
-
     # Placeholder: For Training, it may be required to output per-input tensor shape
     # Assumption: per-input tensor shape is a 1D-Tensor where each element
     # represents the length of the corresponding input along the axis
@@ -521,10 +503,6 @@ def reshape_sinf(iTList, oTList, op, **kwargs):
     oTList[0].shape = output_shape
     oTList[0].dtype = iTList[0].dtype
 
-    # Compute data if inputs have data
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_reshape
-    oTList[0].data = try_compute_data(compute_reshape, iTList, op)
-
     op.perf_stats = {
             'inElems' : int(iTList[0].nelems() + B.nelems()),
             'outElems': int(oTList[0].nelems()),
@@ -536,27 +514,28 @@ def reshape_sinf(iTList, oTList, op, **kwargs):
 
 def expand_sinf(iTList, oTList, op, **kwargs):
     A = iTList[0]
-    shapeT = iTList[1].clone_by_shape(data_maybe_missing=True) #shapeT.data should exist
-    target_shape = [x.item() for x in shapeT.data]
-    input_shape  = A.shape
+    shapeT = iTList[1].clone_by_shape(data_maybe_missing=False)  
+    assert shapeT.data is not None, "ExpandOp requires shape tensor with data"
 
-    # Align shapes by prepending 1s to input_shape if needed
-    if len(target_shape) > len(input_shape):
-        input_shape = [1] * (len(target_shape) - len(input_shape)) + input_shape
+    target_shape = [int(x) for x in shapeT.data]
+    input_shape = list(A.shape)
 
-    assert len(target_shape) == len(input_shape), f"Input & Target shapes length mismatch: {input_shape} vs {target_shape}"
-    for i, (in_dim, tgt_dim) in enumerate(zip(input_shape, target_shape)):
-        if tgt_dim != in_dim and in_dim != 1:
-            raise ValueError(f"Cannot expand dimension {i}: input dim {in_dim} to target dim {tgt_dim}")
-    oTList[0].shape = target_shape
+    out_shape = multidirectional_broadcast_shape_inference(
+        [input_shape, target_shape]
+    )
+
+    oTList[0].shape = out_shape
     oTList[0].dtype = A.dtype
+
+    inElems  = A.nelems() + shapeT.nelems()
+    outElems = oTList[0].nelems()
     op.perf_stats = {
-            'inElems' : A.nelems() + shapeT.nelems(),
-            'outElems': oTList[0].nelems(),
-            'inBytes' : A.nbytes(op.precision) + shapeT.nbytes(op.precision),
-            'outBytes': oTList[0].nbytes(op.precision),
-            'instrs'  : {'mov': oTList[0].nelems()}
-            }
+        'inElems':  inElems,
+        'outElems': outElems,
+        'inBytes':  A.nbytes(op.precision) + shapeT.nbytes(op.precision),
+        'outBytes': oTList[0].nbytes(op.precision),
+        'instrs':   {'mov': outElems},
+    }
     return
 
 def split_sinf(iTList, oTList, op, **kwargs):
@@ -679,22 +658,27 @@ def shape_op_inf_func(iTList, oTList, op, **kwargs):
     return
 
 def transpose_op_inf_func(iTList, oTList, op, **kwargs):
-    perms  = op.attrs['perm']
-    assert len(perms) == iTList[0].rank(), f"perms({perms}) must be equal to input rank ({iTList[0].rank()})!!"
-    oTList[0].shape = [iTList[0].shape[i] for i in perms]
-    oTList[0].dtype = iTList[0].dtype
+    dataT = iTList[0]
+    assert dataT.check_shape(), f"Illegal Shape for {dataT}"
 
-    # Compute data if available
-    from ttsim.ops.desc.data_compute import try_compute_data, compute_transpose
-    oTList[0].data = try_compute_data(compute_transpose, iTList, op)
+    perms = op.attrs.get('perm', None)
+    if perms is None:
+        rank = dataT.rank()
+        perms = list(range(rank - 1, -1, -1))
+
+    assert len(perms) == dataT.rank(), \
+        f"perms({perms}) must be equal to input rank ({dataT.rank()})!!"
+
+    oTList[0].shape = [dataT.shape[i] for i in perms]
+    oTList[0].dtype = dataT.dtype
 
     op.perf_stats = {
-            'inElems' : iTList[0].nelems(),
-            'outElems': oTList[0].nelems(),
-            'inBytes' : iTList[0].nbytes(op.precision),
-            'outBytes': oTList[0].nbytes(op.precision),
-            'instrs'  : {'mov': oTList[0].nelems()}
-            }
+        'inElems' : dataT.nelems(),
+        'outElems': oTList[0].nelems(),
+        'inBytes' : dataT.nbytes(op.precision),
+        'outBytes': oTList[0].nbytes(op.precision),
+        'instrs'  : {'mov': oTList[0].nelems()}
+    }
     return
 
 def register_tensor_ops():
