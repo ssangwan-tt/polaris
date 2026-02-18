@@ -48,6 +48,138 @@ workloads:
     instances:
       bert_base : { path: 'onnx/bert-fixed-128.onnx', seq_len: 128, bs: 1 }
 
+  - api: ONNX
+    name: VIT-BASE
+    basedir: workloads/onnx
+    module: vit-base-fixed-224.onnx
+    instances:
+      default: { path: vit-base-fixed-224.onnx,
+                 bs: 8,
+                 img_height: 224,
+                 img_width: 224 }
+
+  - api: ONNX
+    name: UNET-BASE
+    basedir: workloads/onnx
+    module: unet-fixed-256.onnx
+    instances:
+      default: { path: unet-fixed-256.onnx,
+                 bs: 1,
+                 img_height: 256,
+                 img_width: 256 }
+
+  - api: ONNX
+    name: LLAMA3_1B
+    basedir: workloads/onnx
+    module: llama3_1b_fixed-128.onnx
+    instances:
+      default: { path: llama3_1b_fixed-128.onnx,
+                 bs: 1,
+                 seq_len: 128 }
+
+  - api: ONNX
+    name: LLAMA3_3B
+    basedir: workloads/onnx
+    module: llama3_3b_fixed-128.onnx
+    instances:
+      default: { path: llama3_3b_fixed-128.onnx,
+                 bs: 1,
+                 seq_len: 128 }
+
+  - api: ONNX
+    name: LLAMA3_8B
+    basedir: workloads/onnx
+    module: llama3_8b_fixed-128.onnx
+    instances:
+      default: { path: llama3_8b_fixed-128.onnx,
+                 bs: 1,
+                 seq_len: 128 }
+
+  - api: ONNX
+    name: MAMBA_2.8B
+    basedir: workloads/onnx
+    module: mamba_2.8b_fixed-128.onnx
+    instances:
+      default: { path: mamba_2.8b_fixed-128.onnx,
+                 bs: 1,
+                 seq_len: 128 }
+
+  - api: ONNX
+    name: DETR-BASE
+    basedir: workloads/onnx
+    module: detr-fixed-800.onnx
+    instances:
+      default: { path: detr-fixed-800.onnx,
+                 bs: 1,
+                 img_height: 800,
+                 img_width: 800 }
+
+  - api: ONNX
+    name: ADI_AUTOENCODER
+    basedir: workloads/onnx
+    module: autoencoder_int8.onnx
+    instances:
+      default: { path: autoencoder_int8.onnx, bs: 1 }
+
+  - api: ONNX
+    name: ADI_ECG_AUTOENCODER
+    basedir: workloads/onnx
+    module: ecg_autoencoder_quant_8x8.onnx
+    instances:
+      default: { path: ecg_autoencoder_quant_8x8.onnx, bs: 1 }
+
+  - api: ONNX
+    name: ADI_KWS_DSCNN
+    basedir: workloads/onnx
+    module: kws_ds_cnn_quant_8x8.onnx
+    instances:
+      default: { path: kws_ds_cnn_quant_8x8.onnx, bs: 1 }
+
+  - api: ONNX
+    name: ADI_MOBILENETV2_INT8
+    basedir: workloads/onnx
+    module: mobilenetv2_original_int8.onnx
+    instances:
+      default: { path: mobilenetv2_original_int8.onnx, bs: 1 }
+
+# YOLOv8 detection + segmentation
+  - api: ONNX
+    name: yolov8s_detection_640x640
+    basedir: workloads/onnx
+    module: yolov8s_detection_640x640.onnx
+    instances:
+      default: { path: yolov8s_detection_640x640.onnx, bs: 1, img_height: 640, img_width: 640 }
+
+  - api: ONNX
+    name: yolov8l_detection_4kx4k
+    basedir: workloads/onnx
+    module: yolov8l_detection_4kx4k.onnx
+    instances:
+      default: { path: yolov8l_detection_4kx4k.onnx, bs: 1, img_height: 4096, img_width: 4096 }
+
+  - api: ONNX
+    name: yolov8l_detection_640x640
+    basedir: workloads/onnx
+    module: yolov8l_detection_640x640.onnx
+    instances:
+      default: { path: yolov8l_detection_640x640.onnx, bs: 1, img_height: 640, img_width: 640 }
+
+  - api: ONNX
+    name: yolov8l_segmentation_4kx4k
+    basedir: workloads/onnx
+    module: yolov8l_segmentation_4kx4k.onnx
+    instances:
+      default: { path: yolov8l_segmentation_4kx4k.onnx, bs: 1, img_height: 4096, img_width: 4096 }
+
+  - api: ONNX
+    name: yolov8l_segmentation_640x640
+    basedir: workloads/onnx
+    module: yolov8l_segmentation_640x640.onnx
+    instances:
+      default: { path: yolov8l_segmentation_640x640.onnx, bs: 1, img_height: 640, img_width: 640 }
+
+  
+
   - api: TTSIM
     name: BEVDepth
     basedir: workloads/bevdepth

@@ -1,24 +1,54 @@
 #!/usr/bin/env python
 # SPDX-FileCopyrightText: (C) 2025 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
-from loguru import logger
-import math
-import networkx as nx
 from collections import defaultdict
 
+import networkx as nx
+import numpy as np
 #for graph2onnx
 import onnx
+from loguru import logger
 from onnx import TensorProto
-from onnx.helper import make_model, make_node, make_graph, make_tensor_value_info, make_tensor
 from onnx.checker import check_model
-import numpy as np
+from onnx.helper import make_graph, make_model, make_node, make_tensor, make_tensor_value_info
 
 from ttsim.ops import SimOp, SimTensor
-from ttsim.back.device import Device
 
 LOG   = logger
 INFO  = LOG.info
 DEBUG = LOG.debug
+
+def convert_torch_attrs_to_onnx(optype: str, attrs: dict) -> dict:
+    """
+    Convert PyTorch/Torch-style attribute names to ONNX-compatible attribute names.
+
+    This function handles attribute name mismatches between PyTorch/Torch conventions
+    and ONNX specifications. It can be extended for future attribute conversions.
+
+    Args:
+        optype: The operator type (e.g., 'Softmax', 'LogSoftmax')
+        attrs: Dictionary of operator attributes
+
+    Returns:
+        Dictionary with converted attribute names
+    """
+    # Convert 'dim' to 'axis' for Softmax/LogSoftmax (ONNX uses 'axis')
+    if optype in ['Softmax', 'LogSoftmax'] and 'dim' in attrs:
+        if 'axis' in attrs:
+            raise ValueError(
+                f"Cannot convert attributes for {optype}: both 'dim' and 'axis' are present"
+            )
+        converted_attrs = attrs.copy()
+        converted_attrs['axis'] = converted_attrs.pop('dim')
+        return converted_attrs
+
+    # Future extensions can be added here:
+    # Example: if optype == 'SomeOp' and 'torch_attr' in attrs:
+    #     converted_attrs = attrs.copy()
+    #     converted_attrs['onnx_attr'] = converted_attrs.pop('torch_attr')
+    #     return converted_attrs
+
+    return attrs
 
 class WorkloadGraph():
     # Type hint for instance attribute
@@ -34,6 +64,10 @@ class WorkloadGraph():
         self._input_tensors  = []                # Input Tensors in the Graph  : List[Str] Op Names
         self._output_tensors = []                # Output Tensors in the Graph : List[Str] Op Names
         self._optype_hist    = defaultdict(int)  # Op Type Histogram           : Dict[Str, Int]
+        # Per-graph sequence counter to assign unique sequence numbers to operators based on
+        # addition order. This ensures deterministic ordering when multiple valid topological
+        # orderings exist, which is critical for reproducible CSV stats output.
+        self._seqcounter     = 0
 
     def get_node_count(self)     : return self._graph.number_of_nodes()
     def get_edge_count(self)     : return self._graph.number_of_edges()
@@ -43,7 +77,21 @@ class WorkloadGraph():
     def get_output_nodes(self)   : return self._output_nodes
     def get_input_tensors(self)  : return self._input_tensors
     def get_output_tensors(self) : return self._output_tensors
-    def get_ordered_nodes(self)  : return list(nx.topological_sort(self._graph))
+    def get_ordered_nodes(self):
+        """
+        Return nodes in a deterministic topological order.
+
+        Uses lexicographical topological sort with operator sequence numbers (seqno) as the
+        tie-breaking key. This ensures that when multiple valid topological orderings exist,
+        the same ordering is always chosen based on the addition order of operators to this graph.
+        This determinism is essential for:
+        - Consistent CSV stats output (opnum and row ordering)
+        - Reproducible results across multiple runs
+
+        Returns:
+            List of operator names in deterministic topological order.
+        """
+        return list(nx.lexicographical_topological_sort(self._graph, key=lambda x: self._ops[x].seqno))
 
     def is_input_node(self, opname): return opname in self._input_nodes
     def is_output_node(self, opname): return opname in self._output_nodes
@@ -59,6 +107,11 @@ class WorkloadGraph():
             assert tensor_name in self._tensors, \
                     f"Output SimTensor {tensor_name} for SimOp {op.name} not found in WorkloadGraph"
         assert op.name not in self._ops, f"SimOp({op.name}) is not unique!!!"
+        # Assign sequence number based on addition order to this graph. This is used as a
+        # tie-breaker in lexicographical topological sort to ensure deterministic operator
+        # ordering, even when the graph has multiple valid orderings.
+        op.seqno = self._seqcounter
+        self._seqcounter += 1
         self._ops[op.name] = op
 
     def add_tensor(self, tensor: SimTensor):
@@ -169,7 +222,6 @@ class WorkloadGraph():
                 if self.get_optype(opname).upper() == pattern[0]:
                     current_node          = opname
                     matched_nodes_list    = [current_node]
-                    current_node_op_type  = self.get_optype(current_node).upper()
                     for i in range(1, pattern_len):
                         successors = self.get_successors(current_node)
                         if ( len(successors) == 1 and
@@ -222,14 +274,15 @@ class WorkloadGraph():
             try:
                 self._ops[opname].uses_compute_pipe = rsrc
             except KeyError as e:
-                raise RuntimeError(f'node={opname} operator={optype} rsrc={rsrc} error!')
+                raise RuntimeError(f'node={opname} operator={optype} rsrc={rsrc} error!') from e
         return
 
     def graph2onnx(self, onnx_filename, /, producer_name="ttsim.functional.export",
                    do_model_check=True, filter_op_attrs=None):
         nptype_map = {
+                np.float16: TensorProto.FLOAT16,
                 np.float32: TensorProto.FLOAT,
-                np.float64: TensorProto.FLOAT,
+                np.float64: TensorProto.DOUBLE,
                 np.uint8:   TensorProto.UINT8,
                 np.uint16:  TensorProto.UINT16,
                 np.uint32:  TensorProto.UINT32,
@@ -248,7 +301,8 @@ class WorkloadGraph():
             # somewhere in ttsim.front.functional we are creating float dims!!!
             # thens this stupid line to create shape0 can be removed
             shape0 = tuple([int(d) for d in tval.shape])
-            assert tval.dtype.type in nptype_map, f"dtype={tval.dtype} not yet supported. Pl. edit wl_graph accordingly!!"
+            dtype_type = np.dtype(tval.dtype).type
+            assert dtype_type in nptype_map, f"dtype={tval.dtype} not yet supported. Pl. edit wl_graph accordingly!!"
 
             if shape0 == (): #rank-0 tensor
                 if tval.data is None:
@@ -263,7 +317,7 @@ class WorkloadGraph():
 
             if tval.is_const:
                 onnx_constants[tname] = make_tensor(name=tname,
-                                                    data_type=nptype_map[tval.dtype.type],
+                                                    data_type=nptype_map[dtype_type],
                                                     dims=shape0,
                                                     vals=val_list
                                                     )
@@ -271,13 +325,13 @@ class WorkloadGraph():
                 #print("onnx_params", tval)
                 #print("onnx_params", tval.data.shape, tval.data.size)
                 onnx_params[tname] = make_tensor(name=tname,
-                                                 data_type=nptype_map[tval.dtype.type],
+                                                 data_type=nptype_map[dtype_type],
                                                  dims=shape0,
                                                  vals=val_list
                                                  )
             else:
                 onnx_tensors[tname] = make_tensor_value_info(tname,
-                                                             nptype_map[tval.dtype.type],
+                                                             nptype_map[dtype_type],
                                                              shape0)
 
         onnx_nodes = {}
@@ -286,6 +340,8 @@ class WorkloadGraph():
                 onnx_attrs = filter_op_attrs(op.attrs)
             else:
                 onnx_attrs = op.attrs
+            # Convert torch-style attributes to ONNX-compatible attributes
+            onnx_attrs = convert_torch_attrs_to_onnx(op.optype, onnx_attrs)
             onnx_nodes[oname] = make_node(op.optype, op.inList, op.outList, name=oname, **onnx_attrs)
 
         input_list        = [onnx_tensors[x] for x in self.get_input_tensors() if x in onnx_tensors]

@@ -5,7 +5,7 @@ from typing import Any
 from collections import defaultdict
 
 import onnx
-from onnx import helper, numpy_helper, shape_inference
+from onnx import helper, numpy_helper, shape_inference, TensorProto
 import onnx.checker
 
 from ttsim.graph import WorkloadGraph
@@ -37,8 +37,20 @@ def parse_onnx_model(wlname, wlpath):
     """
 
     onnxhdrinfo = {'name': wlname, 'framework_type': 'ONNX'}
-    modelpb = onnx.load(wlpath)
-    onnx.checker.check_model(modelpb)
+    # Intentionally load the model without external data: we only need shapes/graph structure (shape-only mode).
+    modelpb = onnx.load_model(wlpath, load_external_data=False)
+    try:
+        onnx.checker.check_model(modelpb)
+    except RuntimeError as e:
+        msg = str(e)
+        if "should be stored in" in msg and "doesn't exist or is not accessible" in msg:
+            print(
+                f"WARNING: skipping onnx.checker.check_model for {wlpath} "
+                f"because external data is missing (shape-only mode)."
+            )
+        else:
+            raise
+
     modelpb_inferred = shape_inference.infer_shapes(modelpb)
     modelpb = modelpb_inferred
 
@@ -65,8 +77,8 @@ def parse_onnx_model(wlname, wlpath):
 
     #metadata_props is a map <str, str> where key is model_author and val is model_license
     onnxhdrinfo['metadata_props'] = {}
-    for k in modelpb.metadata_props:
-        onnxhdrinfo['metadata_props'][k] = modelpb.metadata_props[k]
+    for entry in modelpb.metadata_props:
+        onnxhdrinfo['metadata_props'][entry.key] = entry.value
 
     #Graph-Protobuf...
     onnxgraphinfo: dict[str, Any] = {}
@@ -97,16 +109,24 @@ def parse_onnx_model(wlname, wlpath):
     onnxgraphinfo['value_info']  = parse_value_info_list(modelpb.graph.value_info)
     onnxgraphinfo['initializer'] = {}
     for tensor in modelpb.graph.initializer:
-        dims       = [int(dim) for dim in tensor.dims]
-        dtype      = helper.tensor_dtype_to_np_dtype(tensor.data_type)
-        data       = numpy_helper.to_array(tensor)
-        assert tensor.name not in onnxgraphinfo['initializer'], f"Initializer Tensor {tensor.name} not unique"
+        dims = [int(dim) for dim in tensor.dims]
+        dtype = helper.tensor_dtype_to_np_dtype(tensor.data_type)
+        # Default to no data; we only load data for non-external (small) tensors.
+        data = None
+        if tensor.data_location != TensorProto.DataLocation.EXTERNAL:  # type: ignore[attr-defined]
+            try:
+                data = numpy_helper.to_array(tensor)
+            except Exception:
+                data = None
+
+        assert tensor.name not in onnxgraphinfo['initializer'], \
+            f"Initializer Tensor {tensor.name} not unique"
         onnxgraphinfo['initializer'][tensor.name] = {
-                "name": tensor.name,
-                "dtype": dtype,
-                "dims": dims,
-                "data": data
-                }
+            "name": tensor.name,
+            "dtype": dtype,
+            "dims": dims,
+            "data": data,
+        }
 
     #Node Fields
         #name	    string	    An optional name of the node, used for diagnostic purposes only.
@@ -149,7 +169,10 @@ def parse_onnx_model(wlname, wlpath):
 def parse_value_info_list(vlist):
     tbl = {}
     for vi in vlist:
-        assert vi.name not in tbl, f"value info name {vi.name} not unique!!"
+        if vi.name in tbl:
+            # Keep the first and skip duplicates.
+            print(f"WARNING: duplicate value_info '{vi.name}', keeping first and skipping duplicate")
+            continue
         tbl[vi.name] = parse_value_info(vi)
     return tbl
 
@@ -195,17 +218,14 @@ def onnx_get_value_from_attrs(attr, **kwargs):
 
     if len(attr.ints) > 0:       return [int(value) for value in attr.ints]
     elif len(attr.floats) > 0:   return [float(value) for value in attr.floats]
-    elif len(attr.strings) > 0:  return [str(value) for value in attr.strings]
+    elif len(attr.strings) > 0:
+        return [value.decode("utf-8") for value in attr.strings]
     elif len(attr.tensors) > 0:  return [numpy_helper.to_array(t) for t in attr.tensors]
-    #elif len(attr.graphs) > 0:   return [onnx_get_graph_from_attrs(g, **kwargs) for g in attr.graphs]
-
     elif attr.HasField("i"):     return int(attr.i)
     elif attr.HasField("f"):     return float(attr.f)
-    elif attr.HasField("s"):     return str(attr.s)
+    elif attr.HasField("s"):
+        return attr.s.decode("utf-8")
     elif attr.HasField("t"):     return numpy_helper.to_array(attr.t)
-    #elif attr.HasField("g"):     return onnx_get_graph_from_attrs(attr.g, **kwargs)
-
-    #TODO: fix this!! hack...for now
     elif len(attr.graphs) > 0:
         print(f"WARNING Subgraphs Present for {attr.name} but not parsed!!")
         return "<GRAPHS>"
@@ -216,10 +236,11 @@ def onnx_get_value_from_attrs(attr, **kwargs):
         raise ValueError(f"Found some unknown type of attribute for key {attr.name}\n{dir(attr)}\n{attr}")
 
 def resolve_tensor(_tname, _info):
-    INIT_TBL       = _info['initializer']
-    VALINFO_TBL    = _info['value_info']
-    IN_TBL         = _info['input']
-    OUT_TBL        = _info['output']
+    INIT_TBL    = _info['initializer']
+    VALINFO_TBL = _info['value_info']
+    IN_TBL      = _info['input']
+    OUT_TBL     = _info['output']
+
     is_initializer = _tname in INIT_TBL
     is_value_info  = _tname in VALINFO_TBL
     is_input       = _tname in IN_TBL
@@ -229,60 +250,107 @@ def resolve_tensor(_tname, _info):
     data  = None
     dtype = None
     tresolve: str = 'None'
+
     if is_initializer:
-        dims  = INIT_TBL[_tname]['dims'] if 'dims' in INIT_TBL[_tname] else None
-        data  = INIT_TBL[_tname]['data'] if 'data' in INIT_TBL[_tname] else None
-        dtype = INIT_TBL[_tname]['dtype'] if 'dtype' in INIT_TBL[_tname] else None
+        entry = INIT_TBL[_tname]
+        dims  = entry.get('dims', None)
+        data  = entry.get('data', None)
+        dtype = entry.get('dtype', None)
         tresolve = 'C'
+
     if is_value_info:
-        v = VALINFO_TBL[_tname]
-        dims1 = v['type']['dims'] if 'type' in v and 'dims' in v['type'] else None
-        dtype1 = v['type']['dtype'] if 'type' in v and 'dtype' in v['type'] else None
+        v     = VALINFO_TBL[_tname]
+        tinfo = v.get('type', {})
+        dims1  = tinfo.get('dims', None)
+        dtype1 = tinfo.get('dtype', None)
+
         if dims is not None:
-            assert dims == dims1, get_io_errstr(_tname, dims, dims1, is_initializer, is_value_info, is_input, is_output, _info)
+            assert dims == dims1, get_io_errstr(
+                _tname, dims, dims1,
+                is_initializer, is_value_info, is_input, is_output, _info
+            )
             assert dtype == dtype1, f"data type mismatch: {dtype} != {dtype1}"
             tresolve += 'V'
         else:
-            dtype = dtype1
+            dims    = dims1
+            dtype   = dtype1
             tresolve = 'V'
-            dims = dims1
-        data1 = v['type']['data'] if 'type' in v and 'data' in v['type'] else None
+
+        data1 = tinfo.get('data', None)
         assert data1 is None, f"data appears in Value Info: {data1}"
+
     if is_input:
-        v = IN_TBL[_tname]
-        dims1 = v['type']['dims'] if 'type' in v and 'dims' in v['type'] else None
-        dtype1 = v['type']['dtype'] if 'type' in v and 'dtype' in v['type'] else None
+        v     = IN_TBL[_tname]
+        tinfo = v.get('type', {})
+        dims1  = tinfo.get('dims', None)
+        dtype1 = tinfo.get('dtype', None)
+
         if dims is not None:
-            assert dims == dims1, get_io_errstr(_tname, dims, dims1, is_initializer, is_value_info, is_input, is_output, _info)
+            assert dims == dims1, get_io_errstr(
+                _tname, dims, dims1,
+                is_initializer, is_value_info, is_input, is_output, _info
+            )
             assert dtype == dtype1, f"data type mismatch: {dtype} != {dtype1}"
             tresolve += 'I'
         else:
-            dtype = dtype1
+            dims    = dims1
+            dtype   = dtype1
             tresolve = 'I'
-            dims = dims1
-        data1 = v['type']['data'] if 'type' in v and 'data' in v['type'] else None
+
+        data1 = tinfo.get('data', None)
         assert data1 is None, f"data appears in Input: {data1}"
+
     if is_output:
-        v = OUT_TBL[_tname]
-        dims1 = v['type']['dims'] if 'type' in v and 'dims' in v['type'] else None
-        dtype1 = v['type']['dtype'] if 'type' in v and 'dtype' in v['type'] else None
+        v     = OUT_TBL[_tname]
+        tinfo = v.get('type', {})
+        dims1  = tinfo.get('dims', None)
+        dtype1 = tinfo.get('dtype', None)
+
         if dims is not None:
-            assert dims == dims1, get_io_errstr(_tname, dims, dims1, is_initializer, is_value_info, is_input, is_output, _info)
+            assert dims == dims1, get_io_errstr(
+                _tname, dims, dims1,
+                is_initializer, is_value_info, is_input, is_output, _info
+            )
             assert dtype == dtype1, f"data type mismatch: {dtype} != {dtype1}"
             tresolve += 'O'
         else:
-            dtype = dtype1
+            dims    = dims1
+            dtype   = dtype1
             tresolve = 'O'
-            dims = dims1
-        data1 = v['type']['data'] if 'type' in v and 'data' in v['type'] else None
+
+        data1 = tinfo.get('data', None)
         assert data1 is None, f"data appears in Output: {data1}"
+
     assert tresolve is not None, f"Unable to resolve tensor {_tname}"
-    # Dynamic or symbolic dimensions (non-integer) are not supported in this pipeline. Set to 1 instead.
-    if dims and any(not isinstance(d, int) for d in dims):
-        print(f"WARNING: Dynamic/symbolic dimensions found in tensor '{_tname}', setting to 1")
-    dims = [d if isinstance(d, int) else 1 for d in dims] # type: ignore[union-attr]
-    return {'name': _tname, 'shape': dims, 'dtype': dtype, 'data': data,
-            'resolve': tresolve, 'op_in': [], 'op_out': []}
+
+    # If ONNX never provided a shape anywhere, treat as scalar [1]
+    if dims is None:
+        print(
+            f"WARNING: ONNX tensor '{_tname}' has no shape information (dims=None); "
+            "treating it as scalar shape [1] in shape-only Polaris mode."
+        )
+        dims = [1]
+
+    # Dynamic or symbolic dimensions (non‑integer) are not supported.
+    # If we see them, coerce to 1 with a warning (safer than crashing for HF DETR).
+    if any(not isinstance(d, int) for d in dims):
+        print(
+            f"WARNING: Dynamic/symbolic dimensions {dims} in tensor '{_tname}', "
+            "coercing all non-int dims to 1 for shape-only Polaris mode."
+        )
+        dims = [d if isinstance(d, int) else 1 for d in dims]
+
+    dims = [int(d) for d in dims]
+
+    return {
+        'name':   _tname,
+        'shape':  dims,
+        'dtype':  dtype,
+        'data':   data,
+        'resolve': tresolve,
+        'op_in':  [],
+        'op_out': [],
+    }
 
 def get_resolved_tensors(G):
     """

@@ -18,7 +18,7 @@
 #     model,
 #     dummy_input,
 #     "resnet50.onnx",
-#     opset_version=17,
+#     opset_version=18,
 #     input_names=["input"],
 #     output_names=["output"],
 #     dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}}
